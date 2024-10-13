@@ -1,10 +1,11 @@
 /* Check the comments first */
 
-import { EventEmitter } from "./emitter";
-import { EventDelayedRepository } from "./event-repository";
-import { EventStatistics } from "./event-statistics";
-import { ResultsTester } from "./results-tester";
-import { triggerRandomly } from "./utils";
+import {EventEmitter} from "./emitter";
+import {EVENT_SAVE_DELAY_MS, EventDelayedRepository} from "./event-repository";
+import {EventStatistics} from "./event-statistics";
+import {ResultsTester} from "./results-tester";
+import {triggerRandomly} from "./utils";
+import { Mutex } from "async-mutex";
 
 const MAX_EVENTS = 1000;
 
@@ -59,29 +60,91 @@ function init() {
 */
 
 class EventHandler extends EventStatistics<EventName> {
-  // Feel free to edit this class
-
   repository: EventRepository;
+  private pendingEvents: Map<EventName, number>;
+  private mutex: Mutex;
 
   constructor(emitter: EventEmitter<EventName>, repository: EventRepository) {
-    super();
+    super()
     this.repository = repository;
+    this.pendingEvents = new Map();
+    this.mutex = new Mutex();
 
-    emitter.subscribe(EventName.EventA, () =>
-      this.repository.saveEventData(EventName.EventA, 1)
-    );
+    EVENT_NAMES.forEach(eventName => {
+      emitter.subscribe(eventName, () => this.handleEvent(eventName));
+    });
+
+
+    setInterval(async () => {
+      await this.mutex.runExclusive(async () => {
+        for (const eventName of EVENT_NAMES) {
+          const pendingEvents = this.pendingEvents.get(eventName);
+          if (pendingEvents && pendingEvents > 0) {
+            try {
+              await this.synchronize(eventName, pendingEvents);
+              this.pendingEvents.set(eventName, 0);
+            } catch (e) {
+              console.error(`Failed to synchronize ${eventName}:`, e);
+            }
+          }
+        }
+      });
+    }, 2000);
+  }
+
+  async synchronize(eventName: EventName, by: number) {
+    try {
+      await this.repository.saveEventData(eventName, by);
+      console.log(`Successfully synchronized ${eventName} with ${by} events.`);
+    } catch (error) {
+      console.error(`Error synchronizing ${eventName}:`, error);
+    }
+  }
+
+  handleEvent(eventName: EventName) {
+    this.setStats(eventName, this.getStats(eventName) + 1);
+
+    this.mutex.runExclusive(() => {
+      this.pendingEvents.set(eventName, (this.pendingEvents.get(eventName) || 0) + 1);
+    }).catch(err => {
+      console.error(`Error in mutex operation: ${err}`);
+    });
   }
 }
 
 class EventRepository extends EventDelayedRepository<EventName> {
   // Feel free to edit this class
+  private rateLimitInterval = EVENT_SAVE_DELAY_MS;
+  private lastRequestTime = 0;
 
-  async saveEventData(eventName: EventName, _: number) {
-    try {
-      await this.updateEventStatsBy(eventName, 1);
-    } catch (e) {
-      // const _error = e as EventRepositoryError;
-      // console.warn(error);
+  async saveEventData(eventName: EventName, by: number) {
+    let attempts = 0;
+    const maxAttempts = 5;
+    const baseDelay = 2000;
+
+    while (attempts < maxAttempts) {
+      const now = Date.now();
+      const timeSinceLastRequest = now - this.lastRequestTime;
+
+      if (timeSinceLastRequest < this.rateLimitInterval) {
+        const delay = this.rateLimitInterval - timeSinceLastRequest;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+
+      try {
+        await this.updateEventStatsBy(eventName, by);
+        this.lastRequestTime = Date.now();
+        break;
+      } catch (e) {
+        attempts++;
+        if (e.includes("Too many requests")) {
+          const retryDelay = baseDelay * Math.pow(2, attempts);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+        } else {
+          console.warn(e);
+          break;
+        }
+      }
     }
   }
 }
